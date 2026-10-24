@@ -1,17 +1,18 @@
 """
-LISA-Lite: a simple LISA-style AI assistant powered by Google Gemini.
+LISA: a simple Jarvis-style AI assistant powered by Google Gemini.
 
 Features
   * Chat with Gemini (remembers the conversation)
-  * Gemini can use "tools": time, weather, Wikipedia, open websites/apps,
-    YouTube/Google search, notes, system status
+  * Gemini can use "tools": time, weather, Wikipedia, web search that answers
+    in the chat, open websites/apps, YouTube/Google in the browser, notes,
+    system status
   * Optional voice mode (speech-to-text + text-to-speech)
 
 Run:
-  python lisa.py              # text chat
-  python lisa.py --speak      # text input, spoken replies
-  python lisa.py --voice      # full voice mode (mic + speaker)
-  python lisa.py --voice --wake   # only reacts when you say "Lisa ..."
+  python lisa.py                 # text chat
+  python lisa.py --speak         # text input, spoken replies
+  python lisa.py --voice         # full voice mode (mic + speaker)
+  python lisa.py --voice --wake  # only reacts when you say "Lisa ..."
 """
 
 import argparse
@@ -50,9 +51,18 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 USER_NAME = os.getenv("USER_NAME", "Boss")
 VOICE_LANG = os.getenv("VOICE_LANG", "en-IN")
-WAKE_WORD = "lisa"
+VOICE_INDEX = int(os.getenv("VOICE_INDEX", "0"))
+VOICE_RATE = int(os.getenv("VOICE_RATE", "175"))
+
+# Speech recognition often spells the name differently, so accept a few.
+WAKE_WORDS = ("lisa", "liza", "leesa", "lyza")
+WAKE_PATTERN = re.compile(r"\b(" + "|".join(WAKE_WORDS) + r")\b", re.IGNORECASE)
+
+# Change this to whatever you want Lisa to say after "Good morning, <name>."
+GREETING_TAIL = "Lisa is here...how can i help you dear."
+
 NOTES_FILE = Path(__file__).with_name("notes.json")
-HTTP_HEADERS = {"User-Agent": "LisaLite/1.0 (student project)"}
+HTTP_HEADERS = {"User-Agent": "LisaAssistant/1.0 (student project)"}
 
 SYSTEM_PROMPT = f"""
 You are LISA, a smart, polite and slightly witty personal AI assistant.
@@ -61,8 +71,10 @@ The user's name is {USER_NAME}; address them naturally (use their name or "sir/m
 Rules:
 - Keep answers short and conversational (1-4 sentences) unless the user asks for detail.
 - Do not use markdown, bullet symbols or emojis; your replies may be spoken aloud.
-- Use the available tools for the current time/date, weather, Wikipedia facts,
-  opening websites or apps, searching, notes and system status.
+- Answer general knowledge questions directly from your own knowledge.
+- For news, recent events, prices, scores or anything that may have changed, use the search_and_answer tool and reply with the answer in the chat.
+- Use search_google ONLY when the user explicitly says to search or open something in Google. Never open the browser otherwise.
+- Use the other tools for time/date, weather, Wikipedia facts, opening websites or apps, YouTube, notes and system status.
 - Never invent real-time data. If a tool fails, say so honestly.
 - If a request is unclear, ask one short clarifying question.
 """.strip()
@@ -123,6 +135,28 @@ def wikipedia_summary(topic: str) -> str:
         return f"Wikipedia lookup failed: {e}"
 
 
+def search_and_answer(query: str) -> str:
+    """Search the web for up-to-date information and return the answer.
+    Use this for news, recent events, scores, prices, or any fact that may have changed.
+    The answer is shown in the chat; it does NOT open a browser.
+
+    Args:
+        query: What to look up.
+    """
+    try:
+        client = genai.Client(api_key=API_KEY)
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=query,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+        return response.text or "I couldn't find anything on that."
+    except Exception as e:
+        return f"Web search failed: {e}"
+
+
 def open_website(url: str) -> str:
     """Open a website in the default web browser.
 
@@ -136,7 +170,9 @@ def open_website(url: str) -> str:
 
 
 def search_google(query: str) -> str:
-    """Search Google for something in the web browser.
+    """Open the Google results page in the web browser.
+    Use this ONLY when the user explicitly asks to search or open something in Google,
+    for example 'search this in google'. Never use it to answer questions.
 
     Args:
         query: What to search for.
@@ -241,8 +277,8 @@ def get_system_status() -> str:
 
 TOOLS = [
     get_current_datetime, get_weather, wikipedia_summary, open_website,
-    search_google, play_on_youtube, open_application, add_note,
-    read_notes, get_system_status,
+    search_and_answer, search_google, play_on_youtube, open_application,
+    add_note, read_notes, get_system_status,
 ]
 
 
@@ -253,38 +289,41 @@ class Voice:
     """Text-to-speech (pyttsx3) and speech-to-text (SpeechRecognition)."""
 
     def __init__(self, want_listen: bool):
-        self.engine = None
         self.recognizer = None
         self.mic = None
 
-        if pyttsx3:
-            try:
-                self.engine = pyttsx3.init()
-                self.engine.setProperty("rate", int(os.getenv("VOICE_RATE", "175")))
-                voices = self.engine.getProperty("voices")
-                index = int(os.getenv("VOICE_INDEX", "0"))
-                if 0 <= index < len(voices):
-                    self.engine.setProperty("voice", voices[index].id)
-            except Exception as e:  # missing espeak/driver, etc.
-                print(f"[!] Text-to-speech unavailable: {e}")
-        else:
+        if pyttsx3 is None:
             print("[!] pyttsx3 not installed -> replies will not be spoken.")
 
         if want_listen:
             if sr is None:
                 sys.exit("Voice input needs: pip install SpeechRecognition PyAudio")
             self.recognizer = sr.Recognizer()
+            self.recognizer.pause_threshold = 0.8        # seconds of silence = you finished
+            self.recognizer.dynamic_energy_threshold = True
             self.mic = sr.Microphone()
             with self.mic as source:
                 print("Calibrating microphone... stay quiet for a second.")
                 self.recognizer.adjust_for_ambient_noise(source, duration=1)
 
     def speak(self, text: str) -> None:
-        if not self.engine:
+        """Speak text. A fresh engine is created each time, because reusing one
+        engine makes pyttsx3 go silent after the first message on Windows."""
+        if pyttsx3 is None:
             return
         clean = re.sub(r"[*_`#>]", "", text)
-        self.engine.say(clean)
-        self.engine.runAndWait()
+        try:
+            engine = pyttsx3.init()
+            engine.setProperty("rate", VOICE_RATE)
+            voices = engine.getProperty("voices")
+            if 0 <= VOICE_INDEX < len(voices):
+                engine.setProperty("voice", voices[VOICE_INDEX].id)
+            engine.say(clean)
+            engine.runAndWait()
+            engine.stop()
+            del engine
+        except Exception as e:
+            print(f"[!] Could not speak: {e}")
 
     def listen(self) -> str:
         """Listen once and return the recognised text ('' if nothing heard)."""
@@ -326,11 +365,11 @@ def ask(chat, text: str) -> str:
 def greeting() -> str:
     hour = datetime.datetime.now().hour
     part = "morning" if hour < 12 else "afternoon" if hour < 18 else "evening"
-    return f"Good {part}, {USER_NAME}. Lisa is here...How can i help you dear."
+    return f"Good {part}, {USER_NAME}. {GREETING_TAIL}"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LISA-Lite assistant")
+    parser = argparse.ArgumentParser(description="LISA assistant")
     parser.add_argument("--voice", action="store_true", help="use microphone + speaker")
     parser.add_argument("--speak", action="store_true", help="speak replies (keyboard input)")
     parser.add_argument("--wake", action="store_true", help="in voice mode, require the wake word")
@@ -357,10 +396,20 @@ def main() -> None:
             if not user_text:
                 continue
             print(f"You: {user_text}")
+
             if args.wake:
-                if WAKE_WORD not in user_text.lower():
+                if not WAKE_PATTERN.search(user_text):
+                    print("(Ignored. Start with 'Lisa', for example: 'Lisa, what time is it?')")
                     continue
-                user_text = re.sub(WAKE_WORD, "", user_text, flags=re.IGNORECASE).strip(" ,.") or "Yes?"
+                user_text = WAKE_PATTERN.sub("", user_text, count=1).strip(" ,.")
+                if not user_text:  # you only said her name
+                    print("LISA: Yes?")
+                    voice.speak("Yes?")
+                    print("Listening for your command...")
+                    user_text = voice.listen()
+                    if not user_text:
+                        continue
+                    print(f"You: {user_text}")
         else:
             try:
                 user_text = input("You: ").strip()
