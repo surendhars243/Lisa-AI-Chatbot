@@ -2,7 +2,8 @@
 LISA: a simple Jarvis-style AI assistant powered by Google Gemini.
 
 Features
-  * Chat with Gemini (remembers the conversation)
+  * Chat with a local Ollama model (unlimited, offline) OR Google Gemini
+    (choose with LLM_PROVIDER in .env)
   * Gemini can use "tools": time, weather, Wikipedia, web search that answers
     in the chat, open websites/apps, YouTube/Google in the browser, notes,
     system status
@@ -35,6 +36,11 @@ from google.genai import types
 
 # Optional voice libraries -------------------------------------------------
 try:
+    import ollama
+except ImportError:
+    ollama = None
+
+try:
     import pyttsx3
 except ImportError:
     pyttsx3 = None
@@ -47,7 +53,11 @@ except ImportError:
 # Configuration ------------------------------------------------------------
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+# Which AI answers your chat: "ollama" (local, unlimited) or "gemini" (cloud, daily quota)
+PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+
+API_KEY = os.getenv("GEMINI_API_KEY")  # needed for provider=gemini and for web search
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 USER_NAME = os.getenv("USER_NAME", "Boss")
 VOICE_LANG = os.getenv("VOICE_LANG", "en-IN")
@@ -59,7 +69,7 @@ WAKE_WORDS = ("lisa", "liza", "leesa", "lyza")
 WAKE_PATTERN = re.compile(r"\b(" + "|".join(WAKE_WORDS) + r")\b", re.IGNORECASE)
 
 # Change this to whatever you want Lisa to say after "Good morning, <name>."
-GREETING_TAIL = "Lisa is here...how can i help you dear."
+GREETING_TAIL = "Lisa online and ready."
 
 NOTES_FILE = Path(__file__).with_name("notes.json")
 HTTP_HEADERS = {"User-Agent": "LisaAssistant/1.0 (student project)"}
@@ -72,7 +82,7 @@ Rules:
 - Keep answers short and conversational (1-4 sentences) unless the user asks for detail.
 - Do not use markdown, bullet symbols or emojis; your replies may be spoken aloud.
 - Answer general knowledge questions directly from your own knowledge.
-- For news, recent events, prices, scores or anything that may have changed, use the search_and_answer tool and reply with the answer in the chat.
+- For news, recent events, prices, scores or anything that may have changed, use the search_and_answer tool if you have it, and reply with the answer in the chat. If you do not have it, say you cannot check live information.
 - Use search_google ONLY when the user explicitly says to search or open something in Google. Never open the browser otherwise.
 - Use the other tools for time/date, weather, Wikipedia facts, opening websites or apps, YouTube, notes and system status.
 - Never invent real-time data. If a tool fails, say so honestly.
@@ -153,8 +163,8 @@ def search_and_answer(query: str) -> str:
             ),
         )
         return response.text or "I couldn't find anything on that."
-    except Exception as e:
-        return f"Web search failed: {e}"
+    except Exception:
+        return "Web search is unavailable right now (quota or network problem)."
 
 
 def open_website(url: str) -> str:
@@ -277,9 +287,14 @@ def get_system_status() -> str:
 
 TOOLS = [
     get_current_datetime, get_weather, wikipedia_summary, open_website,
-    search_and_answer, search_google, play_on_youtube, open_application,
+    search_google, play_on_youtube, open_application,
     add_note, read_notes, get_system_status,
 ]
+# Web search uses Gemini, so it is only offered when a Gemini key exists.
+if API_KEY:
+    TOOLS.append(search_and_answer)
+
+TOOL_MAP = {fn.__name__: fn for fn in TOOLS}
 
 
 # =========================================================================
@@ -344,8 +359,45 @@ class Voice:
 # =========================================================================
 # CHAT
 # =========================================================================
-def create_chat(client: genai.Client):
-    """Create a Gemini chat session (history is kept automatically)."""
+class OllamaChat:
+    """Chat with a local Ollama model, running our Python tools when it asks."""
+
+    def __init__(self):
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    def _trim(self) -> None:
+        """Keep the history short so a small model stays fast."""
+        rest = self.messages[1:][-20:]
+        while rest and not (isinstance(rest[0], dict) and rest[0].get("role") == "user"):
+            rest.pop(0)
+        self.messages = [self.messages[0]] + rest
+
+    def send(self, text: str) -> str:
+        self.messages.append({"role": "user", "content": text})
+        for _ in range(4):  # at most a few tool rounds per message
+            response = ollama.chat(model=OLLAMA_MODEL, messages=self.messages, tools=TOOLS)
+            message = response.message
+            self.messages.append(message)
+            if not message.tool_calls:
+                self._trim()
+                return (message.content or "").strip()
+            for call in message.tool_calls:
+                name = call.function.name
+                args = call.function.arguments or {}
+                func = TOOL_MAP.get(name)
+                try:
+                    result = func(**args) if func else f"Unknown tool: {name}"
+                except Exception as e:
+                    result = f"Tool error: {e}"
+                self.messages.append({"role": "tool", "tool_name": name, "content": str(result)})
+        self._trim()
+        return "Sorry, I couldn't finish that request."
+
+
+def create_chat(client):
+    """Create a chat session for the chosen provider (history is kept automatically)."""
+    if PROVIDER == "ollama":
+        return OllamaChat()
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         tools=TOOLS,  # the SDK runs the matching Python function automatically
@@ -356,10 +408,22 @@ def create_chat(client: genai.Client):
 
 def ask(chat, text: str) -> str:
     try:
+        if isinstance(chat, OllamaChat):
+            return chat.send(text) or "I'm sorry, I couldn't come up with a reply."
         response = chat.send_message(text)
         return (response.text or "").strip() or "I'm sorry, I couldn't come up with a reply."
     except Exception as e:
-        return f"Sorry, I had trouble reaching Gemini: {e}"
+        message = str(e)
+        lowered = message.lower()
+        if "429" in message or "RESOURCE_EXHAUSTED" in message:
+            return ("I've reached today's free Gemini limit. Try again later, "
+                    "or set LLM_PROVIDER=ollama in the .env file.")
+        if PROVIDER == "ollama":
+            if "connect" in lowered or "refused" in lowered:
+                return "I can't reach Ollama. Please open the Ollama app and try again."
+            if "not found" in lowered:
+                return f"The model is missing. Run this in a terminal: ollama pull {OLLAMA_MODEL}"
+        return "Sorry, I had trouble thinking about that. Please try again."
 
 
 def greeting() -> str:
@@ -375,15 +439,28 @@ def main() -> None:
     parser.add_argument("--wake", action="store_true", help="in voice mode, require the wake word")
     args = parser.parse_args()
 
-    if not API_KEY:
+    if PROVIDER not in ("ollama", "gemini"):
+        sys.exit("LLM_PROVIDER must be 'ollama' or 'gemini' (check your .env file).")
+
+    if PROVIDER == "gemini" and not API_KEY:
         sys.exit("GEMINI_API_KEY missing. Copy .env.example to .env and add your key.")
 
-    client = genai.Client(api_key=API_KEY)
+    if PROVIDER == "ollama":
+        if ollama is None:
+            sys.exit("Ollama support needs: pip install ollama")
+        try:
+            ollama.list()  # is the Ollama app running?
+        except Exception:
+            sys.exit("Cannot reach Ollama. Install it from https://ollama.com and open the app.")
+
+    client = genai.Client(api_key=API_KEY) if API_KEY else None
     chat = create_chat(client)
     voice = Voice(want_listen=args.voice) if (args.voice or args.speak) else None
 
     hello = greeting()
-    print(f"\nLISA: {hello}")
+    brain = f"Ollama ({OLLAMA_MODEL})" if PROVIDER == "ollama" else f"Gemini ({MODEL})"
+    print(f"\n[Brain: {brain}]")
+    print(f"LISA: {hello}")
     print("(type 'reset' to clear memory, 'exit' to quit)\n")
     if voice:
         voice.speak(hello)
